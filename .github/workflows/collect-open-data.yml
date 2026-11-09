@@ -1,0 +1,398 @@
+name: Collect HK Open Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout repository
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # ------------------------------------------------------------
+      # 2. Download latest TD + HKO open data
+      # ------------------------------------------------------------
+      - name: Download latest open data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p latest/raw
+
+          echo "========================================"
+          echo "Downloading TD processed segment speeds"
+          echo "========================================"
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 5 \
+            --connect-timeout 20 \
+            --max-time 90 \
+            --user-agent "Mozilla/5.0" \
+            "https://resource.data.one.gov.hk/td/traffic-detectors/irnAvgSpeed-all.xml" \
+            -o latest/raw/segment-speed.xml
+
+          echo
+          echo "========================================"
+          echo "Downloading HKO rainfall nowcast"
+          echo "========================================"
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 5 \
+            --connect-timeout 20 \
+            --max-time 90 \
+            --user-agent "Mozilla/5.0" \
+            "https://data.weather.gov.hk/weatherAPI/hko_data/F3/Gridded_rainfall_nowcast_tc.csv" \
+            -o latest/raw/rainfall.csv
+
+          echo
+          echo "========================================"
+          echo "Downloaded files"
+          echo "========================================"
+
+          ls -lh latest/raw/
+
+      # ------------------------------------------------------------
+      # 3. Validate downloaded files
+      # ------------------------------------------------------------
+      - name: Validate downloaded files
+        shell: python
+        run: |
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import csv
+
+          speed_file = Path(
+              "latest/raw/segment-speed.xml"
+          )
+
+          rain_file = Path(
+              "latest/raw/rainfall.csv"
+          )
+
+          # ------------------------------------
+          # Basic file validation
+          # ------------------------------------
+
+          if not speed_file.exists():
+              raise RuntimeError(
+                  "segment-speed.xml was not downloaded"
+              )
+
+          if speed_file.stat().st_size < 1000:
+              raise RuntimeError(
+                  "segment-speed.xml looks too small: "
+                  f"{speed_file.stat().st_size} bytes"
+              )
+
+          if not rain_file.exists():
+              raise RuntimeError(
+                  "rainfall.csv was not downloaded"
+              )
+
+          if rain_file.stat().st_size < 1000:
+              raise RuntimeError(
+                  "rainfall.csv looks too small: "
+                  f"{rain_file.stat().st_size} bytes"
+              )
+
+          # ------------------------------------
+          # Validate TD XML
+          # Namespace-safe
+          # ------------------------------------
+
+          tree = ET.parse(speed_file)
+          root = tree.getroot()
+
+          segments = [
+              element
+              for element in root.iter()
+              if element.tag.split("}")[-1]
+              == "segment"
+          ]
+
+          if len(segments) < 100:
+              raise RuntimeError(
+                  "Unexpectedly few TD segments: "
+                  f"{len(segments)}"
+              )
+
+          # ------------------------------------
+          # Validate HKO CSV
+          # ------------------------------------
+
+          with rain_file.open(
+              "r",
+              encoding="utf-8-sig",
+              newline=""
+          ) as f:
+              reader = csv.reader(f)
+              rows = list(reader)
+
+          if len(rows) < 100:
+              raise RuntimeError(
+                  "Unexpectedly few HKO rainfall rows: "
+                  f"{len(rows)}"
+              )
+
+          print(
+              "TD segment speed XML validated:"
+          )
+
+          print(
+              f"  Segments = {len(segments)}"
+          )
+
+          print(
+              "HKO rainfall CSV validated:"
+          )
+
+          print(
+              f"  Rows = {len(rows)}"
+          )
+
+      # ------------------------------------------------------------
+      # 4. Convert latest TD XML into lightweight JSON
+      # ------------------------------------------------------------
+      - name: Build latest segment speed JSON
+        shell: python
+        run: |
+          from pathlib import Path
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import xml.etree.ElementTree as ET
+          import json
+
+          speed_file = Path(
+              "latest/raw/segment-speed.xml"
+          )
+
+          tree = ET.parse(speed_file)
+          root = tree.getroot()
+
+          def child_text(element, name):
+
+              for child in element:
+
+                  tag = child.tag.split("}")[-1]
+
+                  if tag == name:
+                      return child.text
+
+              return None
+
+          segments = []
+
+          for element in root.iter():
+
+              tag = element.tag.split("}")[-1]
+
+              if tag != "segment":
+                  continue
+
+              segment_id = child_text(
+                  element,
+                  "segment_id"
+              )
+
+              speed_text = child_text(
+                  element,
+                  "speed"
+              )
+
+              valid = child_text(
+                  element,
+                  "valid"
+              )
+
+              if not segment_id:
+                  continue
+
+              try:
+                  speed = float(speed_text)
+              except (TypeError, ValueError):
+                  speed = None
+
+              segments.append({
+                  "segment_id": str(segment_id),
+                  "speed_kmh": speed,
+                  "valid": valid
+              })
+
+          if len(segments) < 100:
+              raise RuntimeError(
+                  "Segment JSON build returned "
+                  f"only {len(segments)} segments"
+              )
+
+          now = datetime.now(
+              ZoneInfo("Asia/Hong_Kong")
+          )
+
+          latest = {
+              "status": "ok",
+              "updated": now.isoformat(
+                  timespec="seconds"
+              ),
+              "segment_count": len(segments),
+              "segments": segments
+          }
+
+          latest_dir = Path("latest")
+
+          latest_dir.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          output_file = (
+              latest_dir /
+              "segment-speed.json"
+          )
+
+          with output_file.open(
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              json.dump(
+                  latest,
+                  f,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              )
+
+          print(
+              f"Built segment-speed.json "
+              f"with {len(segments)} segments"
+          )
+
+      # ------------------------------------------------------------
+      # 5. Create source status file
+      # ------------------------------------------------------------
+      - name: Write data status
+        shell: python
+        run: |
+          from pathlib import Path
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import json
+
+          now = datetime.now(
+              ZoneInfo("Asia/Hong_Kong")
+          )
+
+          status = {
+              "status": "ok",
+              "fetched_at": now.isoformat(
+                  timespec="seconds"
+              ),
+              "sources": {
+                  "td_segment_speed": {
+                      "status": "ok",
+                      "file": (
+                          "latest/raw/"
+                          "segment-speed.xml"
+                      )
+                  },
+                  "hko_rainfall": {
+                      "status": "ok",
+                      "file": (
+                          "latest/raw/"
+                          "rainfall.csv"
+                      )
+                  }
+              }
+          }
+
+          latest_dir = Path("latest")
+
+          latest_dir.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          with (
+              latest_dir /
+              "status.json"
+          ).open(
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              json.dump(
+                  status,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(
+              "Built latest/status.json"
+          )
+
+      # ------------------------------------------------------------
+      # 6. Final diagnostic output
+      # ------------------------------------------------------------
+      - name: Show generated files
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Generated latest files"
+          echo "========================================"
+
+          find latest \
+            -maxdepth 2 \
+            -type f \
+            -print \
+            -exec ls -lh {} \;
+
+          echo
+          echo "========================================"
+          echo "Status JSON"
+          echo "========================================"
+
+          cat latest/status.json
+
+      # ------------------------------------------------------------
+      # 7. Commit latest data back into repository
+      # ------------------------------------------------------------
+      - name: Commit collected data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add latest/
+
+          if git diff --cached --quiet; then
+
+            echo "No data changes to commit."
+
+            exit 0
+          fi
+
+          git commit \
+            -m "Update HK open data"
+
+          git push
