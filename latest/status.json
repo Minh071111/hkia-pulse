@@ -1,0 +1,14 @@
+{
+  "status": "ok",
+  "fetched_at": "2026-11-09T10:48:16+08:00",
+  "sources": {
+    "td_segment_speed": {
+      "status": "ok",
+      "file": "latest/raw/segment-speed.xml"
+    },
+    "hko_rainfall": {
+      "status": "ok",
+      "file": "latest/raw/rainfall.csv"
+    }
+  }
+}
